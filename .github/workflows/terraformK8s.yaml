@@ -21,19 +21,19 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  TF_VAR_datadog_app_key: ${{ secrets.TF_VAR_DATADOG_APP_KEY }}
+  TF_VAR_app_image_tag: ${{ github.event.inputs.app_image_tag || github.ref_name }}
+
 jobs:
   # -------------------------------------------------------
-  # Stage 1 — Helm charts (LBC + Secrets Store CSI)
-  # Precisa rodar antes para instalar os CRDs no cluster
+  # APPLY — Stage 1: Helm charts + CRDs
   # -------------------------------------------------------
   helm:
-    name: "Stage 1 — Helm Charts"
+    name: "Apply 1 — Helm Charts"
     runs-on: ubuntu-latest
     if: github.event.inputs.destroy != 'true'
     environment: production
-    env:
-      TF_VAR_datadog_app_key: ${{ secrets.TF_VAR_DATADOG_APP_KEY }}
-      TF_VAR_app_image_tag: ${{ github.event.inputs.app_image_tag || github.ref_name }}
 
     steps:
       - uses: actions/checkout@v4
@@ -62,17 +62,14 @@ jobs:
             -target=kubernetes_secret_v1.datadog
 
   # -------------------------------------------------------
-  # Stage 2 — Namespace + SecretProviderClass (CRD já existe)
+  # APPLY — Stage 2: Namespace + SecretProviderClass
   # -------------------------------------------------------
   crds:
-    name: "Stage 2 — Namespace e SecretProviderClass"
+    name: "Apply 2 — Namespace e SecretProviderClass"
     runs-on: ubuntu-latest
     needs: helm
     if: always() && needs.helm.result != 'failure'
     environment: production
-    env:
-      TF_VAR_datadog_app_key: ${{ secrets.TF_VAR_DATADOG_APP_KEY }}
-      TF_VAR_app_image_tag: ${{ github.event.inputs.app_image_tag || github.ref_name }}
 
     steps:
       - uses: actions/checkout@v4
@@ -97,17 +94,14 @@ jobs:
             -target=kubernetes_service_account_v1.app
 
   # -------------------------------------------------------
-  # Stage 3 — Aplicação completa (deployments, services, etc.)
+  # APPLY — Stage 3: Aplicação completa
   # -------------------------------------------------------
   app:
-    name: "Stage 3 — Aplicação e Observabilidade"
+    name: "Apply 3 — Aplicação e Observabilidade"
     runs-on: ubuntu-latest
     needs: crds
     if: always() && needs.crds.result != 'failure'
     environment: production
-    env:
-      TF_VAR_datadog_app_key: ${{ secrets.TF_VAR_DATADOG_APP_KEY }}
-      TF_VAR_app_image_tag: ${{ github.event.inputs.app_image_tag || github.ref_name }}
 
     steps:
       - uses: actions/checkout@v4
@@ -135,6 +129,101 @@ jobs:
         if: github.event.inputs.destroy != 'true'
         run: terraform apply --auto-approve tfplan.tfout
 
-      - name: Terraform Destroy
-        if: github.event.inputs.destroy == 'true'
+  # -------------------------------------------------------
+  # DESTROY — Stage 1: Remove aplicação e Ingress primeiro
+  # (aguarda o ALB finalizer ser processado antes de remover o LBC)
+  # -------------------------------------------------------
+  destroy-app:
+    name: "Destroy 1 — Aplicação"
+    runs-on: ubuntu-latest
+    if: github.event.inputs.destroy == 'true'
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init -upgrade
+
+      - name: Destroy — Aplicação (Ingress primeiro)
+        run: |
+          terraform destroy --auto-approve \
+            -target=kubernetes_ingress_v1.app \
+            -target=kubernetes_deployment_v1.app \
+            -target=kubernetes_deployment_v1.worker \
+            -target=kubernetes_horizontal_pod_autoscaler_v2.app \
+            -target=kubernetes_horizontal_pod_autoscaler_v2.worker \
+            -target=kubernetes_service_v1.app \
+            -target=kubernetes_network_policy_v1.default_deny_ingress \
+            -target=kubernetes_network_policy_v1.allow_alb_ingress \
+            -target=kubernetes_network_policy_v1.default_deny_egress \
+            -target=kubernetes_network_policy_v1.allow_egress \
+            -target=datadog_dashboard.kunlatek \
+            -target=datadog_monitor.alta_latencia \
+            -target=datadog_monitor.taxa_erro \
+            -target=datadog_monitor.cpu_alta \
+            -target=datadog_monitor.pods_reiniciando
+
+  # -------------------------------------------------------
+  # DESTROY — Stage 2: Remove namespace e SecretProviderClass
+  # -------------------------------------------------------
+  destroy-crds:
+    name: "Destroy 2 — Namespace e SecretProviderClass"
+    runs-on: ubuntu-latest
+    needs: destroy-app
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init -upgrade
+
+      - name: Destroy — Namespace e SecretProviderClass
+        run: |
+          terraform destroy --auto-approve \
+            -target=kubernetes_manifest.secret_provider \
+            -target=kubernetes_service_account_v1.app \
+            -target=kubernetes_namespace_v1.this
+
+  # -------------------------------------------------------
+  # DESTROY — Stage 3: Remove Helm charts por último
+  # -------------------------------------------------------
+  destroy-helm:
+    name: "Destroy 3 — Helm Charts"
+    runs-on: ubuntu-latest
+    needs: destroy-crds
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init -upgrade
+
+      - name: Destroy — Helm charts
         run: terraform destroy --auto-approve
