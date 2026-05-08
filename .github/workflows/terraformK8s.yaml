@@ -1,0 +1,140 @@
+name: Terraform K8s
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      app_image_tag:
+        description: 'Tag da imagem no ECR (ex: 1.0.0-abc1234)'
+        required: false
+        default: 'latest'
+      destroy:
+        description: 'Executar terraform destroy?'
+        required: true
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # -------------------------------------------------------
+  # Stage 1 — Helm charts (LBC + Secrets Store CSI)
+  # Precisa rodar antes para instalar os CRDs no cluster
+  # -------------------------------------------------------
+  helm:
+    name: "Stage 1 — Helm Charts"
+    runs-on: ubuntu-latest
+    if: github.event.inputs.destroy != 'true'
+    environment: production
+    env:
+      TF_VAR_datadog_app_key: ${{ secrets.TF_VAR_DATADOG_APP_KEY }}
+      TF_VAR_app_image_tag: ${{ github.event.inputs.app_image_tag || github.ref_name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init -upgrade
+
+      - name: Apply — Helm charts
+        run: |
+          terraform apply --auto-approve \
+            -target=helm_release.lbc \
+            -target=helm_release.secrets_store_csi \
+            -target=helm_release.aws_secrets_provider \
+            -target=helm_release.cluster_autoscaler \
+            -target=helm_release.datadog \
+            -target=kubernetes_service_account_v1.lbc \
+            -target=kubernetes_namespace_v1.datadog \
+            -target=kubernetes_secret_v1.datadog
+
+  # -------------------------------------------------------
+  # Stage 2 — Namespace + SecretProviderClass (CRD já existe)
+  # -------------------------------------------------------
+  crds:
+    name: "Stage 2 — Namespace e SecretProviderClass"
+    runs-on: ubuntu-latest
+    needs: helm
+    if: always() && needs.helm.result != 'failure'
+    environment: production
+    env:
+      TF_VAR_datadog_app_key: ${{ secrets.TF_VAR_DATADOG_APP_KEY }}
+      TF_VAR_app_image_tag: ${{ github.event.inputs.app_image_tag || github.ref_name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init -upgrade
+
+      - name: Apply — Namespace e SecretProviderClass
+        if: github.event.inputs.destroy != 'true'
+        run: |
+          terraform apply --auto-approve \
+            -target=kubernetes_namespace_v1.this \
+            -target=kubernetes_manifest.secret_provider \
+            -target=kubernetes_service_account_v1.app
+
+  # -------------------------------------------------------
+  # Stage 3 — Aplicação completa (deployments, services, etc.)
+  # -------------------------------------------------------
+  app:
+    name: "Stage 3 — Aplicação e Observabilidade"
+    runs-on: ubuntu-latest
+    needs: crds
+    if: always() && needs.crds.result != 'failure'
+    environment: production
+    env:
+      TF_VAR_datadog_app_key: ${{ secrets.TF_VAR_DATADOG_APP_KEY }}
+      TF_VAR_app_image_tag: ${{ github.event.inputs.app_image_tag || github.ref_name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init -upgrade
+
+      - name: Terraform Validate
+        if: github.event.inputs.destroy != 'true'
+        run: terraform validate
+
+      - name: Terraform Plan
+        if: github.event.inputs.destroy != 'true'
+        run: terraform plan -out=tfplan.tfout
+
+      - name: Terraform Apply
+        if: github.event.inputs.destroy != 'true'
+        run: terraform apply --auto-approve tfplan.tfout
+
+      - name: Terraform Destroy
+        if: github.event.inputs.destroy == 'true'
+        run: terraform destroy --auto-approve
